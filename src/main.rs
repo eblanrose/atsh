@@ -1,17 +1,24 @@
+mod cfg;
+
 use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
 use portable_pty::{CommandBuilder, PtySize};
-use rand::Rng;
-use rsa::{RsaPrivateKey, RsaPublicKey, Pkcs1v15Encrypt};
+use rand::{random, Rng};
+use rsa::{RsaPrivateKey, RsaPublicKey, Oaep};
 use pkcs1::DecodeRsaPublicKey;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{Read, Write as IoWrite};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
+use rsa::sha2::Sha256;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
+use crate::cfg::{config_path, data_path, json_path, keys_path, load_keys, Config};
+use directories_next::ProjectDirs;
 
 const MAX_PACKET: usize = 1200;
 const SESSION_TTL: u64 = 300;
@@ -42,6 +49,8 @@ struct Srv {
     sock: Arc<UdpSocket>,
     sess: Arc<RwLock<HashMap<SocketAddr, Ses>>>,
     rsa_priv: RsaPrivateKey,
+    config: Config,
+    allowed_keys: HashSet<Vec<u8>>,
 }
 
 impl Srv {
@@ -49,35 +58,47 @@ impl Srv {
         let sock = Arc::new(UdpSocket::bind(bind).await?);
         let mut rng = rand::thread_rng();
         let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)?;
-        
+
+        let config: Config = Config::load(json_path(config_path()).unwrap().to_str().unwrap());
+        let mut allowed_keys: HashSet<Vec<u8>> = HashSet::new();
+        allowed_keys.extend(load_keys(&config.clone().key_files, data_path())?);
+
+        fs::create_dir_all(config_path().unwrap()).ok();
+        fs::create_dir_all(data_path().unwrap()).ok();
+
+        println!("tip: create 'config.json' in {}", config_path().unwrap().display());
+        println!("all keys in {}", keys_path(data_path()).unwrap().display());
         info!("NotAProto server on {}", bind);
         Ok(Self {
             sock,
             sess: Arc::new(RwLock::new(HashMap::new())),
             rsa_priv,
+            config,
+            allowed_keys
         })
     }
 
     fn rsa_dec(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        Ok(self.rsa_priv.decrypt(Pkcs1v15Encrypt, data)?)
+        Ok(self.rsa_priv.decrypt(Oaep::new::<Sha256>(), data)?)
     }
 
     fn rsa_enc(&self, data: &[u8], pub_key_bytes: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let pub_key = RsaPublicKey::from_pkcs1_der(pub_key_bytes)?;
         let mut rng = rand::thread_rng();
-        Ok(pub_key.encrypt(&mut rng, Pkcs1v15Encrypt, data)?)
+        Ok(pub_key.encrypt(&mut rng, Oaep::new::<Sha256>(), data)?)
     }
 
-    fn chacha_enc(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
-        let cipher = ChaCha20Poly1305::new(key.into());
-        let nonce_bytes: [u8; NONCE_SIZE] = rand::thread_rng().gen();
+    fn chacha_enc(cipher: &ChaCha20Poly1305, plain: &[u8], ) -> Result<Vec<u8>, chacha20poly1305::aead::Error> {
+        let nonce_bytes: [u8; NONCE_SIZE] = random();
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ciphertext = cipher.encrypt(nonce, plain).unwrap();
-        
+
+        let ciphertext = cipher.encrypt(nonce, plain)?;
+
         let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);
-        out
+
+        Ok(out)
     }
 
     fn chacha_dec(key: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
@@ -130,6 +151,14 @@ impl Srv {
                     return Ok(());
                 }
             };
+            let cipher: Arc<ChaCha20Poly1305> = {
+                let sess = self.sess.read().await;
+                if let Some(s) = sess.get(&addr) {
+                    s.cipher.clone()
+                } else {
+                    return Ok(());
+                }
+            };
 
             if let Some(plain) = Self::chacha_dec(&key, &data) {
                 match bincode::deserialize(&plain) {
@@ -151,7 +180,14 @@ impl Srv {
                             Proto::Ping => {
                                 let resp = Proto::Pong;
                                 let plain = bincode::serialize(&resp)?;
-                                let encrypted = Self::chacha_enc(&key, &plain);
+                                let encrypted = match Self::chacha_enc(&cipher, &plain) {
+                                    Ok(data) => data,
+                                    Err(e) => {
+                                        error!("Encryption error for {}: {}", addr, e);
+                                        return Ok(());
+                                    }
+                                };
+
                                 self.sock.send_to(&encrypted, addr).await?;
                             }
                             _ => {}
@@ -161,7 +197,14 @@ impl Srv {
                         error!("Deserialize error from {}: {}", addr, e);
                         let resp = Proto::Error { msg: "Invalid proto".to_string() };
                         let plain = bincode::serialize(&resp)?;
-                        let encrypted = Self::chacha_enc(&key, &plain);
+                        let encrypted = match Self::chacha_enc(&cipher, &plain) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                error!("Encryption error for {}: {}", addr, e);
+                                return Ok(());
+                            }
+                        };
+
                         self.sock.send_to(&encrypted, addr).await?;
                     }
                 }
@@ -176,6 +219,14 @@ impl Srv {
                 Ok(plain) => {
                     match bincode::deserialize(&plain) {
                         Ok(Proto::AuthReq { rsa_pub }) => {
+                            if !self.allowed_keys.contains(&rsa_pub) {
+                                let resp = Proto::AuthFail {
+                                    reason: "key not allowed".to_string(),
+                                };
+                                let resp_bytes = bincode::serialize(&resp)?;
+                                self.sock.send_to(&resp_bytes, addr).await?;
+                                return Ok(());
+                            }
                             let mut rng = rand::thread_rng();
                             let chacha_key: [u8; 32] = rng.gen();
                             let enc_key = self.rsa_enc(&chacha_key, &rsa_pub)?;
@@ -236,13 +287,13 @@ impl Srv {
         
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let sock = self.sock.clone();
-        
-        let key = {
+
+        let cipher = {
             let sess = self.sess.read().await;
             if let Some(s) = sess.get(&addr) {
-                s.key
+                s.cipher.clone()
             } else {
-                return Err("Session not found".into());
+                return Ok(());
             }
         };
         
@@ -262,8 +313,8 @@ impl Srv {
                     Ok(n) if n > 0 => {
                         let proto = Proto::ShellData { data: buf[..n].to_vec() };
                         if let Ok(plain) = bincode::serialize(&proto) {
-                            let encrypted = Srv::chacha_enc(&key, &plain);
-                            let _ = sock.send_to(&encrypted, addr_clone).await;
+                            let encrypted = Srv::chacha_enc(&cipher, &plain);
+                            let _ = sock.send_to(&encrypted.expect("spawn shell encrypt err"), addr_clone).await; // suka fih sdelal spawnlocal a mne blyat eto refactorit chtobi bilo norm (((((((((((((, poka tak hyli
                         }
                     }
                     Ok(_) => break,
@@ -339,6 +390,8 @@ impl Srv {
             sock: self.sock.clone(),
             sess: self.sess.clone(),
             rsa_priv: self.rsa_priv.clone(),
+            config: self.config.clone(),
+            allowed_keys: self.allowed_keys.clone(),
         }
     }
 }
