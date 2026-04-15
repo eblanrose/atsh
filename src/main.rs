@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write as IoWrite};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use rsa::sha2::Sha256;
 use tokio::net::UdpSocket;
@@ -19,6 +19,7 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info};
 use crate::cfg::{config_path, data_path, json_path, keys_path, load_keys, Config};
 use directories_next::ProjectDirs;
+use rsa::pkcs1::{EncodeRsaPrivateKey, DecodeRsaPrivateKey, EncodeRsaPublicKey};
 
 const MAX_PACKET: usize = 1200;
 const SESSION_TTL: u64 = 300;
@@ -53,11 +54,35 @@ struct Srv {
     allowed_keys: HashSet<Vec<u8>>,
 }
 
+
+fn load_or_create_rsa_key() -> Result<RsaPrivateKey, Box<dyn std::error::Error>> {
+    let mut path = data_path().unwrap_or_else(|| PathBuf::from("./"));
+    path.push("server_private.pem");
+
+    let mut rng = rand::thread_rng();
+
+    if path.exists() {
+        let pem = fs::read_to_string(&path)?;
+        let key = RsaPrivateKey::from_pkcs1_pem(&pem)?;
+        return Ok(key);
+    }
+
+    let key = RsaPrivateKey::new(&mut rng, 2048)?;
+
+    let pem = key.to_pkcs1_pem(Default::default())?;
+    fs::create_dir_all(path.parent().unwrap())?;
+    fs::write(&path, pem.as_bytes())?;
+
+    println!("generated new server key at {}", path.display());
+
+    Ok(key)
+}
+
 impl Srv {
     async fn new(bind: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let sock = Arc::new(UdpSocket::bind(bind).await?);
-        let mut rng = rand::thread_rng();
-        let rsa_priv = RsaPrivateKey::new(&mut rng, 2048)?;
+
+        let rsa_priv = load_or_create_rsa_key()?;
 
         let config: Config = Config::load(json_path(config_path()).unwrap().to_str().unwrap());
         let mut allowed_keys: HashSet<Vec<u8>> = HashSet::new();
