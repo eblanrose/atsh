@@ -13,7 +13,7 @@ Maybe only for Linux and BSD based systems
 graph LR
 A[NotATunnel]
 A --> B[Fork + Rewrite] --> D[Client]
-NotAProto --> B --> J[Using NotAProto] --> C
+TCP --> B --> J[Using TCP] --> C
 
 B --> E[Server]
 D --> C
