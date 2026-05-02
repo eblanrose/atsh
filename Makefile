@@ -1,5 +1,5 @@
 CC ?= clang
-CFLAGS ?= -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
+CFLAGS ?= -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE
 LDFLAGS ?= -lutil -lssl -lcrypto
 
 ifdef DEV_NOTLS
