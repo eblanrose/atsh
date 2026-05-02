@@ -1,37 +1,34 @@
 CC = clang
 CFLAGS = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
-LDFLAGS = -lutil
+LDFLAGS = -lutil -lssl -lcrypto
+SRC = src
 
-ifdef TURNOFFCRYPTO
-    CFLAGS += -DTURNOFFCRYPTO
-else
-    LDFLAGS += -lssl -lcrypto
+ifdef DEV_NOTLS
+    CFLAGS += -DDEV_NOTLS
+    LDFLAGS = -lutil
 endif
 
 UNAME_S := $(shell uname -s)
-ANDROID_ABI := $(shell getprop ro.product.cpu.abi 2>/dev/null)
-
 ifeq ($(UNAME_S),Linux)
-ifneq ($(ANDROID_ABI),)
-    LDFLAGS += -lcrypt -ltermux-auth
-else
-    LDFLAGS += -lpam -lcrypt
+    ifneq ($(shell getprop ro.product.cpu.abi 2>/dev/null),)
+        LDFLAGS += -lcrypt -ltermux-auth
+    else
+        LDFLAGS += -lpam -lcrypt
+    endif
 endif
-endif
-
-.PHONY: all cert clean
 
 all: atshd atshc
 
-atshd: src/atshd.c src/auth.c src/crypto.c src/tunnel.c
-	$(CC) $(CFLAGS) -o $@ src/atshd.c src/auth.c src/crypto.c src/tunnel.c $(LDFLAGS)
+atshd: $(SRC)/atshd.c $(SRC)/auth.c $(SRC)/crypto.c
+	$(CC) $(CFLAGS) -o atshd $(SRC)/atshd.c $(SRC)/auth.c $(SRC)/crypto.c $(LDFLAGS)
 
-atshc: src/atshc.c src/auth.c src/crypto.c
-	$(CC) $(CFLAGS) -o $@ src/atshc.c src/auth.c src/crypto.c $(LDFLAGS)
-
-cert:
-	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-		-nodes -keyout atsh.key -out atsh.crt -days 3650 -subj "/CN=ATSH-Server"
+atshc: $(SRC)/atshc.c $(SRC)/auth.c $(SRC)/crypto.c
+	$(CC) $(CFLAGS) -o atshc $(SRC)/atshc.c $(SRC)/auth.c $(SRC)/crypto.c $(LDFLAGS)
 
 clean:
 	rm -f atshd atshc atsh.key atsh.crt
+
+install: all
+	cp atshd /usr/local/bin/
+	cp atshc /usr/local/bin/
+	chmod 755 /usr/local/bin/atshd /usr/local/bin/atshc
