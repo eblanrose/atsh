@@ -13,7 +13,7 @@
 #define explicit_bzero(p,n) do{volatile char*_p=(volatile char*)(p);size_t _n=(n);while(_n--)*_p++=0;}while(0)
 #endif
 #if defined(__ANDROID__)
-#include <termux-auth.h>
+#include <termux-auth/termux-auth.h>
 #elif defined(__linux__)
 #include <security/pam_appl.h>
 #endif

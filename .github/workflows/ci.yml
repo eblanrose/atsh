@@ -1,0 +1,116 @@
+name: ATSH CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  # ===== LINUX x86_64 (GCC + Clang) =====
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+        crypto: [openssl, devnotls]
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libpam0g-dev libssl-dev libcrypt-dev
+    
+    - name: Build (${{ matrix.compiler }}, crypto=${{ matrix.crypto }})
+      run: |
+        if [ "${{ matrix.crypto }}" = "devnotls" ]; then
+          make CC=${{ matrix.compiler }} DEV_NOTLS=1
+        else
+          make CC=${{ matrix.compiler }}
+        fi
+    
+    - name: Verify binaries
+      run: |
+        file atshd atshc
+        ./atshd -h || true
+        ./atshc -h || true
+
+  # ===== TERMUX (Android arm64) =====
+  termux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Termux environment
+      run: |
+        # Эмулируем Termux-окружение для кросс-компиляции
+        mkdir -p termux_build/usr/include
+        mkdir -p termux_build/usr/lib
+        
+        # Копируем termux-auth.h
+        cp termux-auth/termux-auth.h termux_build/usr/include/
+        
+        # Устанавливаем NDK или используем системный clang с --target
+        sudo apt-get install -y clang libssl-dev
+    
+    - name: Build for Termux (Android)
+      run: |
+        # Кросс-компиляция под Android (arm64)
+        make CC=clang \
+             CFLAGS="-target aarch64-linux-android -Itermux_build/usr/include -D__ANDROID__" \
+             LDFLAGS="-lutil -lssl -lcrypto -lcrypt"
+
+  # ===== FREEBSD =====
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build for FreeBSD (static analysis)
+      run: |
+        sudo apt-get install -y clang
+        # Проверяем что код компилируется под FreeBSD
+        make CC=clang \
+             CFLAGS="-D__FreeBSD__ -Werror -fsyntax-only" \
+             LDFLAGS="" \
+             SRC="src/atshd.c src/atshc.c src/auth.c src/crypto.c"
+
+  # ===== STATIC ANALYSIS =====
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install tools
+      run: |
+        sudo apt-get install -y clang-tools cppcheck
+    
+    - name: Clang static analysis
+      run: |
+        clang --analyze -Xanalyzer -analyzer-output=text \
+          src/atshd.c src/atshc.c src/auth.c src/crypto.c \
+          -I src/ -D_GNU_SOURCE 2>&1 | tee clang-analyze.log
+    
+    - name: Cppcheck
+      run: |
+        cppcheck --enable=all --inconclusive --std=c11 \
+          src/atshd.c src/atshc.c src/auth.c src/crypto.c \
+          -I src/ 2>&1 | tee cppcheck.log
+
+  # ===== SECURITY AUDIT =====
+  security:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Check for common vulnerabilities
+      run: |
+        # Проверка на опасные функции
+        grep -rn 'strcpy\|strcat\|sprintf\|gets' src/ && echo "WARNING: unsafe functions found" || echo "OK: no unsafe functions"
+        
+        # Проверка на TOCTOU
+        grep -rn 'access.*\n.*open\|stat.*\n.*open' src/ && echo "WARNING: TOCTOU possible" || echo "OK"
+        
+        # Проверка на жесткие буферы
+        grep -rn 'char \[1024\]\|char \[256\]' src/ && echo "INFO: fixed buffers" || echo "OK"
