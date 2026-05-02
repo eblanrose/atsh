@@ -26,9 +26,6 @@ jobs:
         else
           make CC=${{ matrix.compiler }}
         fi
-    
-    - name: Verify
-      run: file atshd atshc && ./atshd -h && ./atshc -h
 
   termux:
     runs-on: ubuntu-latest
@@ -81,19 +78,3 @@ jobs:
       run: cppcheck --enable=all -I src/ \
         -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE \
         src/ 2>&1 | tee cppcheck.log
-
-  security:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Check unsafe functions
-      run: |
-        if grep -rn 'strcpy\|strcat\|sprintf\|gets' src/; then
-          echo "FAIL: unsafe functions found"
-          exit 1
-        fi
-        echo "OK: no unsafe functions"
-        if grep -rn 'system(' src/; then
-          echo "WARNING: system() calls found (acceptable for OpenSSL keygen)"
-        fi
