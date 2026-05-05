@@ -1,20 +1,22 @@
 #ifndef ATSH_CRYPTO_H
 #define ATSH_CRYPTO_H
+
 #include <stdint.h>
 #include <stddef.h>
-#ifdef DEV_NOTLS
-typedef struct { int handshake_done; } ATSHCrypto;
-#else
-#include <openssl/ssl.h>
-typedef struct { SSL_CTX *ctx; SSL *ssl; int handshake_done; } ATSHCrypto;
-#endif
+
+typedef struct {
+    uint8_t key[32];
+    int handshake_done;
+} ATSHCrypto;
+
 int atsh_crypto_init(void);
 int atsh_crypto_server_init(const char *key_file, const char *cert_file);
-int atsh_handshake_client(ATSHCrypto *c, int fd, const char *host);
-int atsh_handshake_server(ATSHCrypto *c, int fd);
-int atsh_send_frame(ATSHCrypto *c, int fd, uint8_t type, const uint8_t *data, size_t len);
-int atsh_recv_frame(ATSHCrypto *c, int fd, uint8_t *type, uint8_t **data, size_t *len);
+int atsh_crypto_client_init(ATSHCrypto *c, uint32_t session_id, const char *password);
+int atsh_crypto_server_init_session(ATSHCrypto *c, uint32_t session_id, const char *password);
+int atsh_encrypt_frame(ATSHCrypto *c, uint8_t type, const uint8_t *pt, size_t pt_len,
+                       uint8_t **ct, size_t *ct_len);
+int atsh_decrypt_frame(ATSHCrypto *c, const uint8_t *ct, size_t ct_len,
+                       uint8_t **pt, size_t *pt_len);
 void atsh_crypto_wipe(ATSHCrypto *c);
-int atsh_tofu_check(const char *host, const uint8_t *fp, size_t len);
-int atsh_tofu_save(const char *host, const uint8_t *fp, size_t len);
+
 #endif
