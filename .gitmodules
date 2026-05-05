@@ -1,3 +1,6 @@
 [submodule "nap"]
 	path = nap
 	url = https://github.com/eblanrose/notaproto
+[submodule "termux-auth"]
+	path = termux-auth
+	url = https://github.com/termux/termux-auth
