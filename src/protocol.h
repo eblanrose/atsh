@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #define ATSH_DEFAULT_PORT 2811
-#define ATSH_VERSION_MAJOR 1
-#define ATSH_VERSION_MINOR 0
+#define ATSH_VERSION_MAJOR 0
+#define ATSH_VERSION_MINOR 1
 #define ATSH_CODENAME "Bell"
 typedef enum {
     ATSH_MSG_AUTH        = 0x01,

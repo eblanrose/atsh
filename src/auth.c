@@ -24,7 +24,7 @@ static int anti_bruteforce_wait(void) {
     time_t now = time(NULL);
     if (g_fail_time == 0) return 0;
     
-    int delay = (1 << g_fail_count);  // exponential: 1,2,4,8,16...
+    int delay = (1 << g_fail_count);  
     if (delay > 60) delay = 60;
     
     time_t elapsed = now - g_fail_time;

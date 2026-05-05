@@ -13,4 +13,4 @@ int atsh_auth_verify(const char *username, const char *password);
 int atsh_auth_prompt(const char *username, char *password, size_t len,
                      atsh_password_cb cb);
 void atsh_auth_wipe_password(char *password, size_t len);
-#endif // ATSH_AUTH_H
+#endif 
