@@ -3,3 +3,5 @@ atshd
 atshc
 *.key
 *.crt
+test
+*.txt

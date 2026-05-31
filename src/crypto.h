@@ -10,7 +10,7 @@ typedef struct {
 } ATSHCrypto;
 
 int atsh_crypto_init(void);
-int atsh_crypto_server_init(const char *key_file, const char *cert_file);
+int atsh_crypto_server_init(const char *key_f, const char *cert_f);
 int atsh_crypto_client_init(ATSHCrypto *c, uint32_t session_id, const char *password);
 int atsh_crypto_server_init_session(ATSHCrypto *c, uint32_t session_id, const char *password);
 int atsh_encrypt_frame(ATSHCrypto *c, uint8_t type, const uint8_t *pt, size_t pt_len,

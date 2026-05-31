@@ -1,4 +1,3 @@
-
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,7 +5,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
-#include <pty.h>
 #include <pwd.h>
 #include <fcntl.h>
 #include <termios.h>
@@ -15,28 +13,48 @@
 #include <grp.h>
 #include <time.h>
 
+#ifdef __linux__
+#include <pty.h>
+#elif defined(__FreeBSD__)
+#include <libutil.h>
+#endif
+
 #include "nap.h"
 #include "protocol.h"
 #include "auth.h"
 #include "crypto.h"
 #include "tunnel.h"
 
-#define BUFFER_SIZE 65536
+#define BUFFER_SIZE 8192
 
 typedef struct {
     int pty_master;
     pid_t shell_pid;
     ATSHCrypto crypto;
     int crypto_ready;
+    int session_closing;
 } ShellSession;
 
 static volatile sig_atomic_t g_running = 1;
 static NAPServer g_nap;
 static TunnelContext g_tunnels;
 
-void sig_handler(int sig) { (void)sig; g_running = 0; }
+static void sig_handler(int sig) { (void)sig; g_running = 0; }
 
-int shell_spawn(const char *username, int *pty_fd) {
+static int is_shell_alive(pid_t pid) {
+    if (pid <= 0) return 0;
+    int status;
+    pid_t result = waitpid(pid, &status, WNOHANG);
+    if (result == pid) {
+        return 0;
+    }
+    if (kill(pid, 0) == -1 && errno == ESRCH) {
+        return 0;
+    }
+    return 1;
+}
+
+static int shell_spawn(const char *username, int *pty_fd) {
     int master;
     struct winsize ws = {24, 80, 0, 0};
     pid_t pid = forkpty(&master, NULL, NULL, &ws);
@@ -74,22 +92,27 @@ int shell_spawn(const char *username, int *pty_fd) {
     return pid;
 }
 
-void kill_session(ShellSession *s) {
+static void kill_session(ShellSession *s) {
     if (!s) return;
-    if (s->shell_pid > 0) { kill(s->shell_pid, SIGTERM); waitpid(s->shell_pid, NULL, WNOHANG); }
+    if (s->shell_pid > 0 && !s->session_closing) {
+        s->session_closing = 1;
+        kill(s->shell_pid, SIGTERM);
+        usleep(100000);
+        kill(s->shell_pid, SIGKILL);
+        waitpid(s->shell_pid, NULL, WNOHANG);
+    }
     atsh_crypto_wipe(&s->crypto);
     if (s->pty_master >= 0) close(s->pty_master);
     free(s);
 }
 
-
-void on_nap_connect(uint32_t sid, struct sockaddr_in *addr) {
+static void on_nap_connect(uint32_t sid, struct sockaddr_in *addr) {
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr->sin_addr, ip, sizeof(ip));
     printf("[%u] Connected from %s:%d\n", sid, ip, ntohs(addr->sin_port));
 }
 
-int on_nap_auth(uint32_t sid, const char *username, const char *password) {
+static int on_nap_auth(uint32_t sid, const char *username, const char *password) {
     printf("[%u] Auth: %s\n", sid, username);
     int ok = (atsh_auth_verify(username, password) == ATSH_AUTH_OK);
     printf("[%u] Auth %s\n", sid, ok ? "OK" : "FAIL");
@@ -97,10 +120,18 @@ int on_nap_auth(uint32_t sid, const char *username, const char *password) {
         for (size_t i = 0; i < g_nap.max_sessions; i++) {
             if (g_nap.sessions[i].session_id == sid) {
                 ShellSession *shell = calloc(1, sizeof(ShellSession));
+                if (!shell) {
+                    printf("[%u] Memory allocation failed\n", sid);
+                    return -1;
+                }
                 shell->shell_pid = shell_spawn(username, &shell->pty_master);
-                
+                if (shell->shell_pid < 0) {
+                    free(shell);
+                    return -1;
+                }
                 atsh_crypto_server_init_session(&shell->crypto, sid, password);
                 shell->crypto_ready = 1;
+                shell->session_closing = 0;
                 g_nap.sessions[i].user_data = shell;
                 break;
             }
@@ -109,7 +140,7 @@ int on_nap_auth(uint32_t sid, const char *username, const char *password) {
     return ok ? 0 : -1;
 }
 
-void on_nap_data(uint32_t sid, uint8_t channel, const uint8_t *data, size_t len) {
+static void on_nap_data(uint32_t sid, uint8_t channel, const uint8_t *data, size_t len) {
     (void)channel;
     ShellSession *shell = NULL;
     for (size_t i = 0; i < g_nap.max_sessions; i++) {
@@ -119,13 +150,16 @@ void on_nap_data(uint32_t sid, uint8_t channel, const uint8_t *data, size_t len)
             break;
         }
     }
-    if (!shell || shell->pty_master < 0) return;
+    if (!shell || shell->pty_master < 0 || shell->session_closing) return;
 
     uint8_t *pt; size_t pt_len;
     if (shell->crypto_ready) {
         atsh_decrypt_frame(&shell->crypto, data, len, &pt, &pt_len);
     } else {
-        pt = malloc(len); memcpy(pt, data, len); pt_len = len;
+        pt = malloc(len);
+        if (!pt) return;
+        memcpy(pt, data, len);
+        pt_len = len;
     }
     
     for (size_t i = 0; i < pt_len; i++) {
@@ -151,7 +185,7 @@ void on_nap_data(uint32_t sid, uint8_t channel, const uint8_t *data, size_t len)
     free(pt);
 }
 
-void on_nap_disconnect(uint32_t sid) {
+static void on_nap_disconnect(uint32_t sid) {
     printf("[%u] Disconnected\n", sid);
     for (size_t i = 0; i < g_nap.max_sessions; i++) {
         if (g_nap.sessions[i].session_id == sid) {
@@ -166,45 +200,71 @@ int main(int argc, char *argv[]) {
     uint16_t port = ATSH_DEFAULT_PORT;
     TunnelConfig tunnels[16];
     size_t num_tunnels = 0;
+    
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-p") && i+1 < argc) port = (uint16_t)atoi(argv[++i]);
+        if (!strcmp(argv[i], "-p") && i+1 < argc) {
+            port = (uint16_t)atoi(argv[++i]);
+        }
         else if (!strcmp(argv[i], "-t") && i+3 < argc && num_tunnels < 16) {
             tunnels[num_tunnels].proto = TUNNEL_TCP;
-            tunnels[num_tunnels].listen_port = (uint16_t)atoi(argv[++i]);
-            strncpy(tunnels[num_tunnels].remote_host, argv[++i], 255);
-            tunnels[num_tunnels].remote_port = (uint16_t)atoi(argv[++i]);
+            tunnels[num_tunnels].listen_port = (uint16_t)atoi(argv[i+1]);
+            strncpy(tunnels[num_tunnels].remote_host, argv[i+2], 255);
+            tunnels[num_tunnels].remote_port = (uint16_t)atoi(argv[i+3]);
+            tunnels[num_tunnels].remote_host[255] = '\0';
             tunnels[num_tunnels].enabled = 1;
             num_tunnels++;
-        } else if (!strcmp(argv[i], "-u") && i+3 < argc && num_tunnels < 16) {
+            i += 3;
+        }
+        else if (!strcmp(argv[i], "-u") && i+3 < argc && num_tunnels < 16) {
             tunnels[num_tunnels].proto = TUNNEL_UDP;
-            tunnels[num_tunnels].listen_port = (uint16_t)atoi(argv[++i]);
-            strncpy(tunnels[num_tunnels].remote_host, argv[++i], 255);
-            tunnels[num_tunnels].remote_port = (uint16_t)atoi(argv[++i]);
+            tunnels[num_tunnels].listen_port = (uint16_t)atoi(argv[i+1]);
+            strncpy(tunnels[num_tunnels].remote_host, argv[i+2], 255);
+            tunnels[num_tunnels].remote_port = (uint16_t)atoi(argv[i+3]);
+            tunnels[num_tunnels].remote_host[255] = '\0';
             tunnels[num_tunnels].enabled = 1;
             num_tunnels++;
+            i += 3;
         }
     }
+    
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGCHLD, SIG_IGN);
+    
     atsh_tunnel_init(&g_tunnels, 16);
-    for (size_t i = 0; i < num_tunnels; i++) atsh_tunnel_add(&g_tunnels, &tunnels[i]);
+    for (size_t i = 0; i < num_tunnels; i++) {
+        atsh_tunnel_add(&g_tunnels, &tunnels[i]);
+    }
     atsh_tunnel_start_all(&g_tunnels);
+    
     memset(&g_nap, 0, sizeof(g_nap));
     g_nap.on_connect = on_nap_connect;
     g_nap.on_auth = on_nap_auth;
     g_nap.on_data = on_nap_data;
     g_nap.on_disconnect = on_nap_disconnect;
+    
     if (nap_server_init(&g_nap, port, 16) < 0) return 1;
-    printf("=== ATSH Bell RC3 :%d ===\n", port);
+    
+    printf("=== ATSH Bell :%d ===\n", port);
+    
     while (g_running) {
         nap_server_poll(&g_nap, 100);
         atsh_tunnel_poll(&g_tunnels, 0);
+        
         for (size_t i = 0; i < g_nap.max_sessions; i++) {
             NAPSession *sess = &g_nap.sessions[i];
             if (sess->state != NAP_SESSION_ACTIVE || !sess->user_data) continue;
             ShellSession *shell = (ShellSession*)sess->user_data;
-            if (shell->pty_master < 0 || shell->shell_pid <= 0) continue;
+            if (shell->pty_master < 0) continue;
+            
+            if (!is_shell_alive(shell->shell_pid) && !shell->session_closing) {
+                printf("[%u] Shell process died, closing session\n", sess->session_id);
+                shell->session_closing = 1;
+                nap_server_send(&g_nap, sess->session_id, NAP_MSG_CLOSE, NULL, 0);
+                nap_server_close_session(&g_nap, sess->session_id);
+                continue;
+            }
+            
             char buf[BUFFER_SIZE];
             ssize_t n = read(shell->pty_master, buf, sizeof(buf));
             if (n > 0) {
@@ -216,10 +276,17 @@ int main(int argc, char *argv[]) {
                 } else {
                     nap_server_send(&g_nap, sess->session_id, NAP_MSG_DATA, (uint8_t*)buf, n);
                 }
-            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-            else nap_server_close_session(&g_nap, sess->session_id);
+            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            } else if (n == 0 && !shell->session_closing) {
+                printf("[%u] EOF on pty, closing session\n", sess->session_id);
+                shell->session_closing = 1;
+                nap_server_send(&g_nap, sess->session_id, NAP_MSG_CLOSE, NULL, 0);
+                nap_server_close_session(&g_nap, sess->session_id);
+            }
         }
     }
+    
     atsh_tunnel_cleanup(&g_tunnels);
     nap_server_cleanup(&g_nap);
     return 0;
