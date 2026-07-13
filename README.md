@@ -13,9 +13,9 @@ Maybe only for Linux and BSD based systems
 graph LR
 A[NotATunnel]
 A --> B[Fork + Rewrite] --> D[Client]
-TCP --> B --> J[Using TCP] --> C
+TCP --> B --> J[Using UDP] --> C
 
 B --> E[Server]
 D --> C
-E --> C[ATSH]
+E --> C[ATSH/ATSHd]
 ```
